@@ -93,10 +93,27 @@ def zone_minutes(zones_payload: Any) -> list[float]:
     return out
 
 
+def sleep_hours_for_date(garmin: Garmin, iso_date: str, cache: dict[str, float | None]) -> float | None:
+    """Hours slept the night ending on ``iso_date`` (Garmin's sleep-day convention)."""
+    if iso_date in cache:
+        return cache[iso_date]
+    try:
+        payload = garmin.get_sleep_data(iso_date)
+    except Exception as e:  # noqa: BLE001
+        print(f"    (sleep unavailable for {iso_date}: {e})")
+        cache[iso_date] = None
+        return None
+    secs = ((payload or {}).get("dailySleepDTO") or {}).get("sleepTimeSeconds")
+    hours = sec_to_hr(secs)
+    cache[iso_date] = hours
+    return hours
+
+
 def build_properties(
     activity: dict,
     zones: list[float],
     detail: dict | None,
+    sleep_hours: float | None,
 ) -> dict:
     type_key = activity.get("activityType", {}).get("typeKey", "")
     name = activity.get("activityName") or type_key.title()
@@ -136,6 +153,7 @@ def build_properties(
         "HR Zone 3 (min)": _num(zones[2]),
         "HR Zone 4 (min)": _num(zones[3]),
         "HR Zone 5 (min)": _num(zones[4]),
+        "Sleep (hrs)": _num(sleep_hours),
     }
 
     if summary:
@@ -261,6 +279,7 @@ def main() -> int:
     notion = Notion(auth=notion_token)
     data_source_id = resolve_data_source_id(notion, database_id)
 
+    sleep_cache: dict[str, float | None] = {}
     created = skipped = failed = 0
     for a in tracked:
         activity_id = str(a["activityId"])
@@ -285,7 +304,10 @@ def main() -> int:
                 print(f"    (detail unavailable: {e})")
                 detail = None
 
-            props = build_properties(a, zones, detail)
+            activity_date = a["startTimeLocal"][:10]
+            sleep_hrs = sleep_hours_for_date(garmin, activity_date, sleep_cache)
+
+            props = build_properties(a, zones, detail, sleep_hrs)
 
             if args.dry_run:
                 print(f"  DRY   {label}")

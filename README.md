@@ -61,6 +61,7 @@ Every Notion property below is auto-filled from Garmin:
 | Avg HR, Max HR, Avg Moving Speed (mph), Avg Cadence (spm), Avg Temp (F) | summary |
 | Aerobic TE, Anaerobic TE, Training Effect, Training Load | Garmin training metrics |
 | HR Zone 1–5 (min) | `get_activity_hr_in_timezones` |
+| Sleep (hrs) | Prior night's sleep from `get_sleep_data` for the activity date |
 | RPE | `directWorkoutRpe ÷ 10` (Garmin stores it ×10) |
 | Feel | `directWorkoutFeel` snapped to Very Weak / Weak / Normal / Strong / Very Strong |
 | Personal Record | `pr` flag |
