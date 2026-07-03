@@ -169,13 +169,15 @@ Progression Notes, Pack Weight (lbs), Trainer Led.
 If your database has a **`FIT File`** and/or **`GPX File`** column of type **Files &
 media**, each newly-synced activity's raw files are downloaded from Garmin and attached:
 
-- **FIT File** — the activity's original FIT, decoded to JSON (`<activity>.json`).
-- **GPX File** — the activity's GPX track (`<activity>.xml`).
+- **FIT File** — the activity's original FIT, decoded to JSON (`<activity>.json.gz`).
+- **GPX File** — the activity's GPX track (`<activity>.xml.gz`).
 
-Notion's upload API rejects `.fit` and `.gpx` extensions, so the files are stored as
-Notion-accepted types: the FIT is decoded to JSON, and the GPX is attached as `.xml`
-(GPX is valid XML — rename it to `.gpx` to open it in a GPS app). During a normal sync,
-attachments only run for **new** activities.
+Notion's upload API rejects `.fit`/`.gpx` extensions, so the FIT is decoded to JSON and
+the GPX kept as XML. All attachments are then **gzipped** (`.gz`, an accepted Notion
+type) — both for consistency and because the verbose FIT JSON runs several MB uncompressed
+and would blow past Notion's upload limit (5 MiB on free workspaces); gzip shrinks it
+~5–10×. Download and `gunzip` (or open with any archive tool) to get the `.json`/`.xml`
+back. During a normal sync, attachments only run for **new** activities.
 
 **Back-fill existing rows** — to attach files to activities already in Notion (imported
 before this feature, or before you added the columns), run the one-time back-fill:
@@ -200,7 +202,7 @@ logged and skipped without failing the rest of the activity. Configure via:
 | `SYNC_ATTACHMENTS` | `true` | Master toggle for FIT/GPX attachments |
 | `NOTION_FIT_PROPERTY` | `FIT File` | Files column for the decoded FIT JSON |
 | `NOTION_GPX_PROPERTY` | `GPX File` | Files column for the GPX track |
-| `NOTION_UPLOAD_MAX_MB` | `20` | Skip files larger than this (Notion single-part limit) |
+| `NOTION_UPLOAD_MAX_MB` | `5` | Skip attachments larger than this *after* gzip (free-tier limit; paid workspaces can raise to `20`) |
 
 ### Physiology metrics
 
@@ -212,8 +214,9 @@ response lag**, **HR recovery** during stops, **cadence-vs-grade** bands, and th
 speed-vs-grade with Tobler's hiking function, cadence-vs-grade) without re-parsing the
 track.
 
-- The **full JSON record** (~5–25 KB, incl. the scatter point clouds) is attached to a
-  **`Metrics JSON`** file column — the source of truth for redrawing plots.
+- The **full JSON record** (~5–25 KB, incl. the scatter point clouds) is gzipped and
+  attached to a **`Metrics JSON`** file column (`<activity>.metrics.json.gz`) — the
+  source of truth for redrawing plots.
 - A handful of **headline scalars** are promoted to their own number columns so they
   filter and roll up across activities: `Aerobic Decoupling (%)`, `HR Response Lag (s)`,
   `HRR @60s (bpm)`, `HRR Full (bpm)`, `Moving Time (hrs)`, `Stopped Time (min)`,
