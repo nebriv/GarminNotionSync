@@ -654,6 +654,52 @@ def build_attachment_props(
     return props, attached
 
 
+def _rich_text_value(prop: dict | None) -> str:
+    """Flatten a Notion title/rich_text property value to plain text."""
+    if not prop:
+        return ""
+    segs = prop.get("rich_text") or prop.get("title") or []
+    return "".join(s.get("plain_text") or (s.get("text") or {}).get("content") or "" for s in segs)
+
+
+def _page_activity_id(page: dict) -> str | None:
+    """The ``Garmin Activity ID`` stored on a Notion page, if any."""
+    val = _rich_text_value((page.get("properties") or {}).get("Garmin Activity ID")).strip()
+    return val or None
+
+
+def _page_title(page: dict) -> str:
+    """The page's title-property text (used to name the uploaded files)."""
+    for prop in (page.get("properties") or {}).values():
+        if prop.get("type") == "title" or "title" in prop:
+            return _rich_text_value(prop)
+    return ""
+
+
+def _page_missing_attachment_kinds(page: dict, targets: dict[str, str], force: bool) -> dict[str, str]:
+    """Subset of ``targets`` whose column is empty on this page (or all, if ``force``)."""
+    props = page.get("properties") or {}
+    missing: dict[str, str] = {}
+    for kind, name in targets.items():
+        if force or not ((props.get(name) or {}).get("files") or []):
+            missing[kind] = name
+    return missing
+
+
+def iter_data_source_pages(notion: Notion, data_source_id: str, page_size: int = 100):
+    """Yield every page in a Notion data source, following pagination."""
+    cursor: str | None = None
+    while True:
+        kwargs = {"data_source_id": data_source_id, "page_size": page_size}
+        if cursor:
+            kwargs["start_cursor"] = cursor
+        resp = _retry(lambda: notion.data_sources.query(**kwargs), what="query pages")
+        yield from resp.get("results", [])
+        if not resp.get("has_more"):
+            return
+        cursor = resp.get("next_cursor")
+
+
 # --------------------------------------------------------------------------- #
 # Sync engine
 # --------------------------------------------------------------------------- #
@@ -830,6 +876,129 @@ def sync_once(days: int, dry_run: bool = False) -> SyncResult:
 
 
 # --------------------------------------------------------------------------- #
+# Backfill: attach files to activities already in Notion
+# --------------------------------------------------------------------------- #
+
+
+def _backfill_pages(
+    garmin: Garmin,
+    notion: Notion,
+    data_source_id: str,
+    targets: dict[str, str],
+    result: SyncResult,
+    *,
+    force: bool,
+    dry_run: bool,
+    pacing: float,
+) -> None:
+    """Walk existing Notion pages and fill in any missing FIT/GPX attachments.
+    Counts land on ``result``: ``created`` = pages filled, ``skipped`` = already
+    complete / no data, ``attached`` = files added, ``failed`` = update errors."""
+    for page in iter_data_source_pages(notion, data_source_id):
+        activity_id = _page_activity_id(page)
+        title = _page_title(page) or (activity_id or "?")
+        label = f"{title} [{activity_id}]"
+
+        if not activity_id:
+            log.debug("skip  %s: no Garmin Activity ID", label)
+            result.skipped += 1
+            continue
+
+        missing = _page_missing_attachment_kinds(page, targets, force)
+        if not missing:
+            result.skipped += 1
+            continue
+
+        try:
+            if dry_run:
+                log.info("DRY   backfill %s: would attach %s", label, ", ".join(sorted(missing)))
+                result.created += 1
+                result.attached += len(missing)
+                result.created_labels.append(label)
+                continue
+
+            activity = {"activityId": activity_id, "activityName": title}
+            att_props, n = build_attachment_props(garmin, notion, activity, missing)
+            if not att_props:
+                log.warning("skip  %s: no files available from Garmin", label)
+                result.skipped += 1
+                continue
+
+            _retry(
+                lambda: notion.pages.update(page_id=page["id"], properties=att_props),
+                what="update page",
+            )
+            log.info("fill  %s (+%d)", label, n)
+            result.created += 1
+            result.attached += n
+            result.created_labels.append(label)
+            if pacing:
+                time.sleep(pacing)
+        except Exception as e:  # noqa: BLE001
+            log.error("FAIL  %s: %s", label, e)
+            result.failed += 1
+            result.failures.append(f"{label}: {e}")
+
+
+def backfill_once(force: bool = False, dry_run: bool = False) -> SyncResult:
+    """One-time pass that attaches FIT/GPX files to activities already in Notion that
+    are missing them. Idempotent — pages that already have the file are skipped, so a
+    run interrupted by rate limits can simply be re-run. Never raises."""
+    start_t = time.monotonic()
+    result = SyncResult(window_start="backfill", window_end="backfill")
+    log.info("Backfilling activity file attachments (force=%s, dry_run=%s)", force, dry_run)
+
+    try:
+        notion_token = require_env("NOTION_TOKEN")
+        database_id = require_env("NOTION_DATABASE_ID")
+        garmin = garmin_client()
+        login_garmin(garmin)
+    except (ConfigError, GarminConnectAuthenticationError) as e:
+        result.auth_error = str(e)
+        log.error("Authentication/config error: %s", e)
+        result.duration_s = round(time.monotonic() - start_t, 1)
+        return result
+    except Exception as e:  # noqa: BLE001
+        result.auth_error = f"Garmin login failed: {e}"
+        log.exception("Garmin login failed")
+        result.duration_s = round(time.monotonic() - start_t, 1)
+        return result
+
+    result.token_days_remaining = garmin_token_days_remaining(garmin)
+
+    notion = Notion(auth=notion_token)
+    try:
+        data_source_id = _retry(
+            lambda: resolve_data_source_id(notion, database_id), what="resolve_data_source"
+        )
+    except Exception as e:  # noqa: BLE001
+        log.exception("Failed to resolve Notion data source")
+        result.failed += 1
+        result.failures.append(f"resolve data source: {e}")
+        result.duration_s = round(time.monotonic() - start_t, 1)
+        return result
+
+    targets = attachment_targets(notion, data_source_id)
+    if not targets:
+        log.warning("No FIT/GPX file columns available — nothing to backfill.")
+        result.duration_s = round(time.monotonic() - start_t, 1)
+        return result
+
+    pacing = max(0.0, float(os.getenv("NOTION_PACING_MS", "350")) / 1000.0)
+    _backfill_pages(
+        garmin, notion, data_source_id, targets, result,
+        force=force, dry_run=dry_run, pacing=pacing,
+    )
+
+    result.duration_s = round(time.monotonic() - start_t, 1)
+    log.info(
+        "Backfill done. filled=%d skipped=%d failed=%d attached=%d duration=%ss",
+        result.created, result.skipped, result.failed, result.attached, result.duration_s,
+    )
+    return result
+
+
+# --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
 
@@ -893,6 +1062,17 @@ def main() -> int:
         help="Interactive Garmin login (handles MFA) to seed/refresh the token store, then exit.",
     )
     parser.add_argument(
+        "--backfill",
+        action="store_true",
+        help="One-time: attach FIT/GPX files to activities already in Notion that are missing "
+        "them, then exit. Idempotent and resumable; combine with --dry-run to preview.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="With --backfill, re-download and overwrite attachments even if already present.",
+    )
+    parser.add_argument(
         "--debug",
         nargs="?",
         const="all",
@@ -910,7 +1090,10 @@ def main() -> int:
             return _do_login()
         if args.debug:
             return _debug_dump(args.days, args.debug)
-        result = sync_once(args.days, dry_run=args.dry_run)
+        if args.backfill:
+            result = backfill_once(force=args.force, dry_run=args.dry_run)
+        else:
+            result = sync_once(args.days, dry_run=args.dry_run)
     except ConfigError as e:
         log.error("%s", e)
         return 2

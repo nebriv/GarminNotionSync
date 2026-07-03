@@ -128,6 +128,8 @@ python sync.py                     # sync last 7 days (default)
 python sync.py --days 30           # sync last 30 days
 python sync.py --dry-run --days 7  # preview without writing
 python sync.py --login             # interactive Garmin login (MFA), then exit
+python sync.py --backfill          # attach FIT/GPX files to existing rows missing them
+python sync.py --backfill --dry-run # preview which rows would be backfilled
 python sync.py --debug             # dump raw Garmin JSON for matched activities
 python sync.py --debug 22540601083 # debug a single activity
 ```
@@ -172,8 +174,22 @@ media**, each newly-synced activity's raw files are downloaded from Garmin and a
 
 Notion's upload API rejects `.fit` and `.gpx` extensions, so the files are stored as
 Notion-accepted types: the FIT is decoded to JSON, and the GPX is attached as `.xml`
-(GPX is valid XML — rename it to `.gpx` to open it in a GPS app). Attachments only run
-for **new** activities, so re-syncing an already-imported activity won't back-fill files.
+(GPX is valid XML — rename it to `.gpx` to open it in a GPS app). During a normal sync,
+attachments only run for **new** activities.
+
+**Back-fill existing rows** — to attach files to activities already in Notion (imported
+before this feature, or before you added the columns), run the one-time back-fill:
+
+```bash
+python sync.py --backfill              # fill in files for rows that are missing them
+python sync.py --backfill --dry-run    # preview which rows would be filled
+python sync.py --backfill --force      # re-download and overwrite existing attachments
+# Docker: docker compose run --rm garmin-notion-sync python sync.py --backfill
+```
+
+It walks every page in the database, downloads the missing FIT/GPX for each, and updates
+the page. It's **idempotent** (rows that already have the file are skipped) and therefore
+**resumable** — if a run is interrupted or rate-limited, just run it again to continue.
 
 The columns are auto-detected: if neither exists the feature is a no-op, so existing
 databases are unaffected. Each attachment is best-effort — a download/upload failure is

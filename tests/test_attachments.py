@@ -172,17 +172,32 @@ class FakeFileUploads:
 
 
 class FakeDataSources:
-    def __init__(self, properties: dict):
+    def __init__(self, properties: dict, pages: list[dict] | None = None):
         self._properties = properties
+        self._pages = pages or []
 
     def retrieve(self, data_source_id):
         return {"properties": self._properties}
 
+    def query(self, **kwargs):
+        # Single-page result; pagination is exercised separately.
+        return {"results": self._pages, "has_more": False, "next_cursor": None}
+
+
+class FakePages:
+    def __init__(self):
+        self.updated: list[tuple[str, dict]] = []
+
+    def update(self, page_id, properties):
+        self.updated.append((page_id, properties))
+        return {"id": page_id}
+
 
 class FakeNotion:
-    def __init__(self, properties: dict | None = None):
+    def __init__(self, properties: dict | None = None, pages: list[dict] | None = None):
         self.file_uploads = FakeFileUploads()
-        self.data_sources = FakeDataSources(properties or {})
+        self.data_sources = FakeDataSources(properties or {}, pages)
+        self.pages = FakePages()
 
 
 # --------------------------------------------------------------------------- #
@@ -301,3 +316,151 @@ def test_build_attachment_props_size_guard(monkeypatch):
     )
     assert attached == 0
     assert props == {}
+
+
+# --------------------------------------------------------------------------- #
+# Page-reading helpers (backfill)
+# --------------------------------------------------------------------------- #
+
+
+def _rich_text(text: str) -> dict:
+    return {"rich_text": [{"plain_text": text, "text": {"content": text}}]}
+
+
+def _title(text: str) -> dict:
+    return {"type": "title", "title": [{"plain_text": text, "text": {"content": text}}]}
+
+
+def _files(*names: str) -> dict:
+    return {"files": [{"name": n} for n in names]}
+
+
+def test_page_activity_id_and_title():
+    page = {
+        "id": "pg1",
+        "properties": {
+            "Name": _title("Morning Run"),
+            "Garmin Activity ID": _rich_text("777"),
+        },
+    }
+    assert sync._page_activity_id(page) == "777"
+    assert sync._page_title(page) == "Morning Run"
+
+
+def test_page_activity_id_missing():
+    assert sync._page_activity_id({"properties": {}}) is None
+    assert sync._page_activity_id({"properties": {"Garmin Activity ID": _rich_text("  ")}}) is None
+
+
+def test_page_missing_attachment_kinds():
+    targets = {"fit": "FIT File", "gpx": "GPX File"}
+    page = {"properties": {"FIT File": _files("run.json"), "GPX File": _files()}}
+    # FIT already present, GPX empty → only GPX is missing.
+    assert sync._page_missing_attachment_kinds(page, targets, force=False) == {"gpx": "GPX File"}
+    # force re-attaches everything.
+    assert sync._page_missing_attachment_kinds(page, targets, force=True) == targets
+
+
+# --------------------------------------------------------------------------- #
+# iter_data_source_pages
+# --------------------------------------------------------------------------- #
+
+
+def test_iter_data_source_pages_paginates():
+    class Paginated:
+        def __init__(self):
+            self.calls = 0
+
+        def query(self, **kwargs):
+            self.calls += 1
+            if kwargs.get("start_cursor") is None:
+                return {"results": [{"id": "a"}], "has_more": True, "next_cursor": "c1"}
+            return {"results": [{"id": "b"}], "has_more": False, "next_cursor": None}
+
+    notion = FakeNotion()
+    notion.data_sources = Paginated()
+    ids = [p["id"] for p in sync.iter_data_source_pages(notion, "ds")]
+    assert ids == ["a", "b"]
+    assert notion.data_sources.calls == 2
+
+
+# --------------------------------------------------------------------------- #
+# _backfill_pages
+# --------------------------------------------------------------------------- #
+
+
+def _backfill_result() -> sync.SyncResult:
+    return sync.SyncResult(window_start="backfill", window_end="backfill")
+
+
+def test_backfill_fills_missing_and_skips_complete(monkeypatch):
+    monkeypatch.delenv("NOTION_UPLOAD_MAX_MB", raising=False)
+    fit = _tiny_fit_bytes()
+    garmin = FakeGarmin(fit=_zip_with({"1.fit": fit}), gpx=b"<gpx/>")
+    pages = [
+        # Missing both → gets filled.
+        {"id": "pg1", "properties": {
+            "Name": _title("Run A"), "Garmin Activity ID": _rich_text("111"),
+            "FIT File": _files(), "GPX File": _files()}},
+        # Already complete → skipped, no download.
+        {"id": "pg2", "properties": {
+            "Name": _title("Run B"), "Garmin Activity ID": _rich_text("222"),
+            "FIT File": _files("b.json"), "GPX File": _files("b.xml")}},
+        # No activity id → skipped.
+        {"id": "pg3", "properties": {"Name": _title("Manual"), "GPX File": _files()}},
+    ]
+    notion = FakeNotion({"FIT File": {"type": "files"}, "GPX File": {"type": "files"}}, pages)
+    result = _backfill_result()
+
+    sync._backfill_pages(
+        garmin, notion, "ds", {"fit": "FIT File", "gpx": "GPX File"}, result,
+        force=False, dry_run=False, pacing=0.0,
+    )
+
+    assert result.created == 1          # only pg1 filled
+    assert result.attached == 2         # fit + gpx
+    assert result.skipped == 2          # pg2 complete, pg3 no id
+    assert result.failed == 0
+    assert [pid for pid, _ in notion.pages.updated] == ["pg1"]
+    updated_props = notion.pages.updated[0][1]
+    assert set(updated_props) == {"FIT File", "GPX File"}
+
+
+def test_backfill_dry_run_uploads_nothing(monkeypatch):
+    monkeypatch.delenv("NOTION_UPLOAD_MAX_MB", raising=False)
+    garmin = FakeGarmin(fit=b"x", gpx=b"y")
+    pages = [{"id": "pg1", "properties": {
+        "Name": _title("Run A"), "Garmin Activity ID": _rich_text("111"),
+        "FIT File": _files(), "GPX File": _files()}}]
+    notion = FakeNotion({"FIT File": {"type": "files"}, "GPX File": {"type": "files"}}, pages)
+    result = _backfill_result()
+
+    sync._backfill_pages(
+        garmin, notion, "ds", {"fit": "FIT File", "gpx": "GPX File"}, result,
+        force=False, dry_run=True, pacing=0.0,
+    )
+
+    assert result.created == 1
+    assert result.attached == 2         # projected, not uploaded
+    assert notion.pages.updated == []   # nothing written
+    assert notion.file_uploads.created == []
+
+
+def test_backfill_no_files_available_is_skipped(monkeypatch):
+    monkeypatch.delenv("NOTION_UPLOAD_MAX_MB", raising=False)
+    garmin = FakeGarmin(gpx=b"")        # empty GPX → nothing to attach
+    pages = [{"id": "pg1", "properties": {
+        "Name": _title("Treadmill"), "Garmin Activity ID": _rich_text("111"),
+        "GPX File": _files()}}]
+    notion = FakeNotion({"GPX File": {"type": "files"}}, pages)
+    result = _backfill_result()
+
+    sync._backfill_pages(
+        garmin, notion, "ds", {"gpx": "GPX File"}, result,
+        force=False, dry_run=False, pacing=0.0,
+    )
+
+    assert result.created == 0
+    assert result.skipped == 1
+    assert result.failed == 0
+    assert notion.pages.updated == []
