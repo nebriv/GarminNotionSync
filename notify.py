@@ -119,8 +119,13 @@ def notify_success(result) -> bool:
     noun = "activity" if result.created == 1 else "activities"
     title = f"✅ Garmin→Notion: {result.created} new {noun}"
 
+    counts = f"**{result.created}** new · {result.skipped} skipped · {result.failed} failed"
+    if getattr(result, "attached", 0):
+        counts += f" · {result.attached} file(s) attached"
+    if getattr(result, "metrics", 0):
+        counts += f" · {result.metrics} with metrics"
     lines = [
-        f"**{result.created}** new · {result.skipped} skipped · {result.failed} failed",
+        counts,
         f"window: {result.window_start} → {result.window_end}  ({result.duration_s:.0f}s)",
     ]
     if result.created_labels:

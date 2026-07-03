@@ -105,6 +105,10 @@ All via environment / `.env` (see `.env.example` for the annotated list):
 | `METRICS_PORT` | `9100` | HTTP port; `0` disables the server |
 | `TRACKED_TYPES` | `hiking,running,trail_running` | Garmin `typeKey`s to sync |
 | `NOTION_PACING_MS` | `350` | Pause between Notion writes (rate limits) |
+| `SYNC_ATTACHMENTS` | `true` | Attach FIT/GPX files (see [Activity file attachments](#activity-file-attachments)) |
+| `NOTION_FIT_PROPERTY` | `FIT File` | Files column for the decoded FIT JSON |
+| `NOTION_GPX_PROPERTY` | `GPX File` | Files column for the GPX track |
+| `NOTION_UPLOAD_MAX_MB` | `20` | Skip attachments larger than this |
 | `TOKEN_WARN_DAYS` | `21` | Warn when token is near expiry |
 | `GARMIN_TOKEN_DIR` | `/data/garmin-tokens` | Token store (mounted volume) |
 | `GARMIN_TOKENS_BASE64` | _(empty)_ | Optional headless token seed |
@@ -124,6 +128,8 @@ python sync.py                     # sync last 7 days (default)
 python sync.py --days 30           # sync last 30 days
 python sync.py --dry-run --days 7  # preview without writing
 python sync.py --login             # interactive Garmin login (MFA), then exit
+python sync.py --backfill          # attach FIT/GPX files to existing rows missing them
+python sync.py --backfill --dry-run # preview which rows would be backfilled
 python sync.py --debug             # dump raw Garmin JSON for matched activities
 python sync.py --debug 22540601083 # debug a single activity
 ```
@@ -152,9 +158,83 @@ Every Notion property below is auto-filled from Garmin:
 | Feel | `directWorkoutFeel` snapped to Very Weak / Weak / Normal / Strong / Very Strong |
 | Personal Record | `pr` flag |
 | Notes | Activity description, if you've set one in Garmin |
+| FIT File | The activity's FIT file, decoded to JSON — see [Activity file attachments](#activity-file-attachments) |
+| GPX File | The activity's GPX track — see [Activity file attachments](#activity-file-attachments) |
 
 These stay **manual** (not touched by the script): Conditions, Focus, Exercises,
 Progression Notes, Pack Weight (lbs), Trainer Led.
+
+### Activity file attachments
+
+If your database has a **`FIT File`** and/or **`GPX File`** column of type **Files &
+media**, each newly-synced activity's raw files are downloaded from Garmin and attached:
+
+- **FIT File** — the activity's original FIT, decoded to JSON (`<activity>.json`).
+- **GPX File** — the activity's GPX track (`<activity>.xml`).
+
+Notion's upload API rejects `.fit` and `.gpx` extensions, so the files are stored as
+Notion-accepted types: the FIT is decoded to JSON, and the GPX is attached as `.xml`
+(GPX is valid XML — rename it to `.gpx` to open it in a GPS app). During a normal sync,
+attachments only run for **new** activities.
+
+**Back-fill existing rows** — to attach files to activities already in Notion (imported
+before this feature, or before you added the columns), run the one-time back-fill:
+
+```bash
+python sync.py --backfill              # fill in files for rows that are missing them
+python sync.py --backfill --dry-run    # preview which rows would be filled
+python sync.py --backfill --force      # re-download and overwrite existing attachments
+# Docker: docker compose run --rm garmin-notion-sync python sync.py --backfill
+```
+
+It walks every page in the database, downloads the missing FIT/GPX for each, and updates
+the page. It's **idempotent** (rows that already have the file are skipped) and therefore
+**resumable** — if a run is interrupted or rate-limited, just run it again to continue.
+
+The columns are auto-detected: if neither exists the feature is a no-op, so existing
+databases are unaffected. Each attachment is best-effort — a download/upload failure is
+logged and skipped without failing the rest of the activity. Configure via:
+
+| Var | Default | Purpose |
+|---|---|---|
+| `SYNC_ATTACHMENTS` | `true` | Master toggle for FIT/GPX attachments |
+| `NOTION_FIT_PROPERTY` | `FIT File` | Files column for the decoded FIT JSON |
+| `NOTION_GPX_PROPERTY` | `GPX File` | Files column for the GPX track |
+| `NOTION_UPLOAD_MAX_MB` | `20` | Skip files larger than this (Notion single-part limit) |
+
+### Physiology metrics
+
+Each activity's GPX track (and FIT summary) are run through
+[`activity_metrics.py`](activity_metrics.py) to compute a structured physiology record:
+summary, HR zones, an **ascent/descent phase split**, **aerobic decoupling**, **HR
+response lag**, **HR recovery** during stops, **cadence-vs-grade** bands, and the
+**scatter + correlation** payloads needed to redraw the response plots (HR-vs-grade,
+speed-vs-grade with Tobler's hiking function, cadence-vs-grade) without re-parsing the
+track.
+
+- The **full JSON record** (~5–25 KB, incl. the scatter point clouds) is attached to a
+  **`Metrics JSON`** file column — the source of truth for redrawing plots.
+- A handful of **headline scalars** are promoted to their own number columns so they
+  filter and roll up across activities: `Aerobic Decoupling (%)`, `HR Response Lag (s)`,
+  `HRR @60s (bpm)`, `HRR Full (bpm)`, `Moving Time (hrs)`, `Stopped Time (min)`,
+  `Ascent VAM (m/h)`, `Descent Speed (kmh)`, `Cadence Flat`, `Cadence Steep`,
+  `Cadence Coverage (%)`, and `Ascent Source`.
+
+By default any of these columns that don't exist are **created automatically** on the
+first run (set `NOTION_CREATE_COLUMNS=false` to opt out and only write to columns you've
+added yourself). Every parameter that moves a number (smoothing window, moving gate, max
+HR, …) is written into the record under `config`, so activities stay comparable even if
+the parameters are retuned later. Metrics run for new activities during a sync and can be
+**back-filled** onto existing rows with `python sync.py --backfill` (same command as the
+file back-fill — it fills whichever of files/metrics a row is missing).
+
+| Var | Default | Purpose |
+|---|---|---|
+| `SYNC_METRICS` | `true` | Master toggle for physiology metrics |
+| `NOTION_METRICS_PROPERTY` | `Metrics JSON` | Files column for the full JSON record |
+| `NOTION_CREATE_COLUMNS` | `true` | Auto-create missing metric columns via the Notion API |
+| `MAX_HR` | `190` | Max HR for the percent-of-max zone model |
+| `METRICS_MIN_TRACKPOINTS` | `30` | Skip metrics for tracks shorter than this (e.g. no-GPS) |
 
 ## Tests
 
@@ -187,6 +267,7 @@ isn't tracked, add its `typeKey` to `TRACKED_TYPES`.
 ## Files
 
 - `sync.py` — sync engine + CLI
+- `activity_metrics.py` — pure physiology-metrics computation (numpy)
 - `runner.py` — scheduler, notifications, health/metrics server (container entrypoint)
 - `notify.py` — Apprise notification wrapper
 - `healthcheck.py` — Docker healthcheck probe
