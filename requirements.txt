@@ -2,6 +2,8 @@
 garminconnect==0.3.2
 notion-client==3.0.0
 python-dotenv==1.2.2
+# Decodes activity FIT files to JSON for the "FIT File" Notion attachment.
+garmin-fit-sdk==21.208.0
 
 # Container runtime: scheduling, notifications, metrics.
 APScheduler==3.11.2

@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import io
 import json
 import logging
 import os
+import re
 import sys
 import time
+import zipfile
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
@@ -56,6 +59,20 @@ DEFAULT_TOKEN_DIR = "~/.garminconnect"
 # Garmin issues a refresh token good for ~1 year; warn before it lapses.
 GARMIN_REFRESH_TOKEN_LIFETIME_DAYS = 365
 
+# --- Activity file attachments (FIT + GPX) -------------------------------------
+# Notion "Files & media" columns the raw activity files are attached to. Notion's
+# upload allowlist rejects .fit/.gpx extensions, so each is stored as a
+# Notion-accepted type:
+#   FIT  -> decoded JSON  (.json, application/json) — viewable in Notion
+#   GPX  -> raw XML       (.xml,  application/xml)  — GPX is valid XML; rename to
+#                                                     .gpx to open in GPS apps
+DEFAULT_FIT_PROPERTY = "FIT File"
+DEFAULT_GPX_PROPERTY = "GPX File"
+
+# Notion single-part uploads top out at 20 MiB (paid) / 5 MiB (free). Anything
+# larger is skipped rather than sent on a guaranteed-to-fail request.
+DEFAULT_UPLOAD_MAX_MB = 20
+
 
 class ConfigError(Exception):
     """A required environment variable is missing or invalid."""
@@ -71,6 +88,20 @@ def require_env(name: str) -> str:
     if not val:
         raise ConfigError(f"Missing env var: {name}")
     return val
+
+
+def env_bool(name: str, default: bool) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() in {"1", "true", "yes", "on", "y"}
+
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, "").strip() or default)
+    except ValueError:
+        return default
 
 
 def token_dir_path() -> str:
@@ -465,6 +496,165 @@ def garmin_token_days_remaining(garmin: Garmin | None = None) -> float | None:
 
 
 # --------------------------------------------------------------------------- #
+# Activity file attachments (FIT -> JSON, GPX -> XML)
+# --------------------------------------------------------------------------- #
+
+_SLUG_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _slug(text: str, fallback: str = "activity") -> str:
+    """Filesystem/URL-safe base name for an uploaded file (max 80 chars)."""
+    s = _SLUG_RE.sub("_", (text or "").strip()).strip("._-")
+    return s[:80] or fallback
+
+
+def _fit_bytes_from_download(raw: bytes | None) -> bytes | None:
+    """Unwrap the .fit from Garmin's ORIGINAL export (a zip); fall back to treating
+    ``raw`` as an already-unwrapped .fit. Returns ``None`` if there's nothing usable."""
+    if not raw:
+        return None
+    if raw[:4] == b"PK\x03\x04":  # zip local-file-header magic
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            names = zf.namelist()
+            fits = [n for n in names if n.lower().endswith(".fit")]
+            name = fits[0] if fits else (names[0] if names else None)
+            return zf.read(name) if name else None
+    return raw
+
+
+def fit_to_json(fit_bytes: bytes) -> bytes:
+    """Decode a FIT activity file into indented JSON bytes (all message streams)."""
+    from garmin_fit_sdk import Decoder, Stream  # lazy: only needed for FIT attachments
+
+    stream = Stream.from_byte_array(fit_bytes)
+    messages, _errors = Decoder(stream).read()
+    return json.dumps(messages, indent=2, default=str).encode("utf-8")
+
+
+def _files_property(upload_id: str, filename: str) -> dict:
+    """A Notion "files" property value referencing an uploaded file."""
+    return {"files": [{"type": "file_upload", "file_upload": {"id": upload_id}, "name": filename}]}
+
+
+def notion_upload(notion: Notion, filename: str, data: bytes, content_type: str) -> str:
+    """Upload ``data`` to Notion via the single-part File Upload API; return the id."""
+    up = _retry(
+        lambda: notion.file_uploads.create(
+            mode="single_part", filename=filename, content_type=content_type
+        ),
+        what="file_upload create",
+    )
+    upload_id = up["id"]
+    _retry(
+        lambda: notion.file_uploads.send(
+            file_upload_id=upload_id, file=(filename, data, content_type)
+        ),
+        what="file_upload send",
+    )
+    return upload_id
+
+
+def _prepare_fit(garmin: Garmin, activity_id: str, base: str) -> tuple[str, bytes, str] | None:
+    raw = garmin.download_activity(activity_id, Garmin.ActivityDownloadFormat.ORIGINAL)
+    fit = _fit_bytes_from_download(raw)
+    if not fit:
+        log.warning("No FIT data for %s — skipping FIT attachment.", activity_id)
+        return None
+    return f"{base}.json", fit_to_json(fit), "application/json"
+
+
+def _prepare_gpx(garmin: Garmin, activity_id: str, base: str) -> tuple[str, bytes, str] | None:
+    raw = garmin.download_activity(activity_id, Garmin.ActivityDownloadFormat.GPX)
+    if not raw:
+        log.warning("No GPX data for %s — skipping GPX attachment.", activity_id)
+        return None
+    return f"{base}.xml", raw, "application/xml"
+
+
+# kind -> (download+convert builder). Order also determines column-fill order.
+_ATTACHMENT_BUILDERS: dict[str, Callable[[Garmin, str, str], tuple[str, bytes, str] | None]] = {
+    "fit": _prepare_fit,
+    "gpx": _prepare_gpx,
+}
+
+
+def attachment_targets(notion: Notion, data_source_id: str) -> dict[str, str]:
+    """Map ``{kind: property_name}`` for the FIT/GPX columns that actually exist as
+    "files" properties. Empty when ``SYNC_ATTACHMENTS`` is off or the columns are
+    absent — so deployments without those columns are unaffected."""
+    if not env_bool("SYNC_ATTACHMENTS", True):
+        log.info("Activity file attachments disabled (SYNC_ATTACHMENTS=false).")
+        return {}
+
+    wanted = {
+        "fit": os.getenv("NOTION_FIT_PROPERTY", DEFAULT_FIT_PROPERTY),
+        "gpx": os.getenv("NOTION_GPX_PROPERTY", DEFAULT_GPX_PROPERTY),
+    }
+    try:
+        ds = _retry(
+            lambda: notion.data_sources.retrieve(data_source_id=data_source_id),
+            what="data source schema",
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("Could not read Notion schema; skipping attachments: %s", e)
+        return {}
+
+    schema = ds.get("properties") or {}
+    targets: dict[str, str] = {}
+    for kind, name in wanted.items():
+        prop = schema.get(name)
+        if prop is None:
+            log.info("No %r column in Notion DB — skipping %s attachments.", name, kind.upper())
+        elif prop.get("type") != "files":
+            log.warning(
+                "Column %r is type %r, not 'files' — skipping %s attachments.",
+                name, prop.get("type"), kind.upper(),
+            )
+        else:
+            targets[kind] = name
+    if targets:
+        log.info(
+            "Attaching activity files to Notion for new activities: %s.",
+            ", ".join(f"{k.upper()}→{v!r}" for k, v in targets.items()),
+        )
+    return targets
+
+
+def build_attachment_props(
+    garmin: Garmin, notion: Notion, activity: dict, targets: dict[str, str]
+) -> tuple[dict, int]:
+    """Download, convert and upload the FIT/GPX files for one activity, returning the
+    Notion "files" properties to merge into the page plus a count attached. Each
+    attachment is isolated: a failure is logged and skipped, never failing the activity."""
+    activity_id = str(activity["activityId"])
+    base = _slug(f"{activity.get('activityName') or ''}-{activity_id}", fallback=activity_id)
+    max_bytes = env_int("NOTION_UPLOAD_MAX_MB", DEFAULT_UPLOAD_MAX_MB) * 1024 * 1024
+
+    props: dict = {}
+    attached = 0
+    for kind, prop_name in targets.items():
+        builder = _ATTACHMENT_BUILDERS[kind]
+        try:
+            prepared = _retry(lambda: builder(garmin, activity_id, base), what=f"{kind} download")
+            if prepared is None:
+                continue
+            filename, data, content_type = prepared
+            if len(data) > max_bytes:
+                log.warning(
+                    "%s for %s is %.1f MB (over the %d MB upload limit) — skipping.",
+                    kind.upper(), activity_id, len(data) / 1_000_000, max_bytes // (1024 * 1024),
+                )
+                continue
+            upload_id = notion_upload(notion, filename, data, content_type)
+            props[prop_name] = _files_property(upload_id, filename)
+            attached += 1
+            log.info("attach %s %s (%.0f KB)", kind.upper(), filename, len(data) / 1024)
+        except Exception as e:  # noqa: BLE001
+            log.warning("%s attachment failed for %s: %s", kind.upper(), activity_id, e)
+    return props, attached
+
+
+# --------------------------------------------------------------------------- #
 # Sync engine
 # --------------------------------------------------------------------------- #
 
@@ -476,6 +666,7 @@ class SyncResult:
     created: int = 0
     skipped: int = 0
     failed: int = 0
+    attached: int = 0
     created_labels: list[str] = field(default_factory=list)
     failures: list[str] = field(default_factory=list)
     auth_error: str | None = None
@@ -489,6 +680,7 @@ class SyncResult:
     def summary(self) -> str:
         return (
             f"created={self.created} skipped={self.skipped} failed={self.failed} "
+            f"attached={self.attached} "
             f"window={self.window_start}→{self.window_end} duration={self.duration_s}s"
         )
 
@@ -499,6 +691,7 @@ class SyncResult:
             "created": self.created,
             "skipped": self.skipped,
             "failed": self.failed,
+            "attached": self.attached,
             "created_labels": self.created_labels,
             "failures": self.failures,
             "auth_error": self.auth_error,
@@ -569,6 +762,8 @@ def sync_once(days: int, dry_run: bool = False) -> SyncResult:
         result.duration_s = round(time.monotonic() - start_t, 1)
         return result
 
+    targets = attachment_targets(notion, data_source_id)
+
     pacing = max(0.0, float(os.getenv("NOTION_PACING_MS", "350")) / 1000.0)
     sleep_cache: dict[str, float | None] = {}
 
@@ -606,6 +801,11 @@ def sync_once(days: int, dry_run: bool = False) -> SyncResult:
                 result.created += 1
                 result.created_labels.append(label)
                 continue
+
+            if targets:
+                att_props, n_attached = build_attachment_props(garmin, notion, a, targets)
+                props.update(att_props)
+                result.attached += n_attached
 
             _retry(
                 lambda: notion.pages.create(

@@ -105,6 +105,10 @@ All via environment / `.env` (see `.env.example` for the annotated list):
 | `METRICS_PORT` | `9100` | HTTP port; `0` disables the server |
 | `TRACKED_TYPES` | `hiking,running,trail_running` | Garmin `typeKey`s to sync |
 | `NOTION_PACING_MS` | `350` | Pause between Notion writes (rate limits) |
+| `SYNC_ATTACHMENTS` | `true` | Attach FIT/GPX files (see [Activity file attachments](#activity-file-attachments)) |
+| `NOTION_FIT_PROPERTY` | `FIT File` | Files column for the decoded FIT JSON |
+| `NOTION_GPX_PROPERTY` | `GPX File` | Files column for the GPX track |
+| `NOTION_UPLOAD_MAX_MB` | `20` | Skip attachments larger than this |
 | `TOKEN_WARN_DAYS` | `21` | Warn when token is near expiry |
 | `GARMIN_TOKEN_DIR` | `/data/garmin-tokens` | Token store (mounted volume) |
 | `GARMIN_TOKENS_BASE64` | _(empty)_ | Optional headless token seed |
@@ -152,9 +156,35 @@ Every Notion property below is auto-filled from Garmin:
 | Feel | `directWorkoutFeel` snapped to Very Weak / Weak / Normal / Strong / Very Strong |
 | Personal Record | `pr` flag |
 | Notes | Activity description, if you've set one in Garmin |
+| FIT File | The activity's FIT file, decoded to JSON — see [Activity file attachments](#activity-file-attachments) |
+| GPX File | The activity's GPX track — see [Activity file attachments](#activity-file-attachments) |
 
 These stay **manual** (not touched by the script): Conditions, Focus, Exercises,
 Progression Notes, Pack Weight (lbs), Trainer Led.
+
+### Activity file attachments
+
+If your database has a **`FIT File`** and/or **`GPX File`** column of type **Files &
+media**, each newly-synced activity's raw files are downloaded from Garmin and attached:
+
+- **FIT File** — the activity's original FIT, decoded to JSON (`<activity>.json`).
+- **GPX File** — the activity's GPX track (`<activity>.xml`).
+
+Notion's upload API rejects `.fit` and `.gpx` extensions, so the files are stored as
+Notion-accepted types: the FIT is decoded to JSON, and the GPX is attached as `.xml`
+(GPX is valid XML — rename it to `.gpx` to open it in a GPS app). Attachments only run
+for **new** activities, so re-syncing an already-imported activity won't back-fill files.
+
+The columns are auto-detected: if neither exists the feature is a no-op, so existing
+databases are unaffected. Each attachment is best-effort — a download/upload failure is
+logged and skipped without failing the rest of the activity. Configure via:
+
+| Var | Default | Purpose |
+|---|---|---|
+| `SYNC_ATTACHMENTS` | `true` | Master toggle for FIT/GPX attachments |
+| `NOTION_FIT_PROPERTY` | `FIT File` | Files column for the decoded FIT JSON |
+| `NOTION_GPX_PROPERTY` | `GPX File` | Files column for the GPX track |
+| `NOTION_UPLOAD_MAX_MB` | `20` | Skip files larger than this (Notion single-part limit) |
 
 ## Tests
 
