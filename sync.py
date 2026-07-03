@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import gzip
 import io
 import json
 import logging
@@ -69,9 +70,10 @@ GARMIN_REFRESH_TOKEN_LIFETIME_DAYS = 365
 DEFAULT_FIT_PROPERTY = "FIT File"
 DEFAULT_GPX_PROPERTY = "GPX File"
 
-# Notion single-part uploads top out at 20 MiB (paid) / 5 MiB (free). Anything
-# larger is skipped rather than sent on a guaranteed-to-fail request.
-DEFAULT_UPLOAD_MAX_MB = 20
+# Notion single-part uploads top out at 5 MiB on free workspaces (20 MiB on paid).
+# Attachments over this are gzipped to fit; only skipped if still too big after that.
+# Default to the free-tier limit; paid users can raise it to keep files uncompressed.
+DEFAULT_UPLOAD_MAX_MB = 5
 
 # --- Physiology metrics --------------------------------------------------------
 # The full JSON metrics record is attached to this Files column; a handful of
@@ -554,7 +556,8 @@ def decode_fit(fit_bytes: bytes) -> dict:
 
 
 def fit_messages_to_json(messages: dict) -> bytes:
-    return json.dumps(messages, indent=2, default=str).encode("utf-8")
+    # Compact separators — decoded FIT is large (multi-MB); indentation only inflates it.
+    return json.dumps(messages, separators=(",", ":"), default=str).encode("utf-8")
 
 
 def fit_to_json(fit_bytes: bytes) -> bytes:
@@ -674,19 +677,26 @@ def download_activity_media(
 
 
 def _upload_files_prop(
-    notion: Notion, data: bytes | None, filename: str, content_type: str, max_bytes: int, what: str
+    notion: Notion, data: bytes | None, filename: str, max_bytes: int, what: str
 ) -> dict | None:
-    """Size-guard + upload ``data`` and return a Notion files-property value (or None)."""
+    """Gzip and upload ``data``, returning a Notion files-property value (or None).
+
+    All attachments are stored gzipped (``.gz``, an accepted Notion type) for
+    consistency and to stay well under Notion's single-part upload limit — the
+    verbose FIT/GPX/JSON payloads compress by roughly 5–10×. Only skipped if it's
+    still over the limit after compression."""
     if not data:
         return None
-    if len(data) > max_bytes:
+    gz = gzip.compress(data)
+    filename = filename + ".gz"
+    if len(gz) > max_bytes:
         log.warning(
-            "%s is %.1f MB (over the %d MB upload limit) — skipping.",
-            what, len(data) / 1_000_000, max_bytes // (1024 * 1024),
+            "%s is %.1f MB gzipped (over the %d MB upload limit) — skipping.",
+            what, len(gz) / 1_000_000, max_bytes // (1024 * 1024),
         )
         return None
-    upload_id = notion_upload(notion, filename, data, content_type)
-    log.info("attach %s (%.0f KB)", filename, len(data) / 1024)
+    upload_id = notion_upload(notion, filename, gz, "application/gzip")
+    log.info("attach %s (%.0f KB, from %.0f KB)", filename, len(gz) / 1024, len(data) / 1024)
     return _files_property(upload_id, filename)
 
 
@@ -837,7 +847,7 @@ def metrics_config():
 
 
 def _metrics_json(record: dict) -> bytes:
-    return json.dumps(record, default=str).encode("utf-8")
+    return json.dumps(record, separators=(",", ":"), default=str).encode("utf-8")
 
 
 def metrics_headline_props(record: dict) -> dict:
@@ -910,15 +920,15 @@ def build_media_props(
     props: dict = {}
     attached = 0
 
-    def _attach(prop_name, data, filename, content_type, what):
+    def _attach(prop_name, data, filename, what):
         nonlocal attached
         try:
             if dry_run:
                 if data:
-                    log.info("DRY   would attach %s", filename)
+                    log.info("DRY   would attach %s.gz", filename)
                     attached += 1
                 return
-            fp = _upload_files_prop(notion, data, filename, content_type, max_bytes, what)
+            fp = _upload_files_prop(notion, data, filename, max_bytes, what)
             if fp is not None:
                 props[prop_name] = fp
                 attached += 1
@@ -927,9 +937,9 @@ def build_media_props(
 
     if fit_prop is not None:
         fit_json = fit_messages_to_json(media.fit_messages) if media.fit_messages else None
-        _attach(fit_prop, fit_json, f"{base}.json", "application/json", "FIT")
+        _attach(fit_prop, fit_json, f"{base}.json", "FIT")
     if gpx_prop is not None:
-        _attach(gpx_prop, media.gpx, f"{base}.xml", "application/xml", "GPX")
+        _attach(gpx_prop, media.gpx, f"{base}.xml", "GPX")
 
     metrics_done = False
     if want_metrics and media.gpx:
@@ -956,7 +966,7 @@ def build_media_props(
                     metrics_done = True
                 else:
                     _attach(metrics.json_prop, _metrics_json(record),
-                            f"{base}.metrics.json", "application/json", "metrics")
+                            f"{base}.metrics.json", "metrics")
                     props.update(headline)
                     metrics_done = True
                     log.info("metrics %s: decouple=%s lag=%ss", activity_id,
@@ -1219,60 +1229,82 @@ def _backfill_pages(
     metrics. Counts land on ``result``: ``created`` = pages filled, ``skipped`` =
     already complete / no data, ``attached`` = files added, ``metrics`` = pages with
     metrics computed, ``failed`` = update errors."""
-    for page in iter_data_source_pages(notion, data_source_id):
-        activity_id = _page_activity_id(page)
-        title = _page_title(page) or (activity_id or "?")
-        label = f"{title} [{activity_id}]"
+    try:
+        pages = iter_data_source_pages(notion, data_source_id)
+        for page in pages:
+            _backfill_page(garmin, notion, page, targets, metrics, result,
+                           force=force, dry_run=dry_run, pacing=pacing)
+    except Exception as e:  # noqa: BLE001 — a page-query failure shouldn't crash the run
+        log.exception("Backfill stopped early")
+        result.failed += 1
+        result.failures.append(f"backfill loop: {e}")
 
-        if not activity_id:
-            log.debug("skip  %s: no Garmin Activity ID", label)
-            result.skipped += 1
-            continue
 
-        missing = _page_missing_attachment_kinds(page, targets, force)
-        want_metrics = metrics is not None and (force or not _page_files_present(page, metrics.json_prop))
-        if not missing and not want_metrics:
-            result.skipped += 1
-            continue
+def _backfill_page(
+    garmin: Garmin,
+    notion: Notion,
+    page: dict,
+    targets: dict[str, str],
+    metrics: "MetricsTarget | None",
+    result: SyncResult,
+    *,
+    force: bool,
+    dry_run: bool,
+    pacing: float,
+) -> None:
+    activity_id = _page_activity_id(page)
+    title = _page_title(page) or (activity_id or "?")
+    label = f"{title} [{activity_id}]"
 
-        wanted = sorted([*missing, *(["metrics"] if want_metrics else [])])
-        try:
-            if dry_run:
-                log.info("DRY   backfill %s: would fill %s", label, ", ".join(wanted))
-                result.created += 1
-                result.attached += len(missing)
-                result.metrics += 1 if want_metrics else 0
-                result.created_labels.append(label)
-                continue
+    if not activity_id:
+        log.debug("skip  %s: no Garmin Activity ID", label)
+        result.skipped += 1
+        return
 
-            activity = {"activityId": activity_id, "activityName": title}
-            page_props, stats = build_media_props(
-                garmin, notion, activity,
-                fit_prop=missing.get("fit"),
-                gpx_prop=missing.get("gpx"),
-                metrics=metrics if want_metrics else None,
-            )
-            if not page_props:
-                log.warning("skip  %s: nothing could be produced from Garmin", label)
-                result.skipped += 1
-                continue
+    missing = _page_missing_attachment_kinds(page, targets, force)
+    want_metrics = metrics is not None and (force or not _page_files_present(page, metrics.json_prop))
+    if not missing and not want_metrics:
+        result.skipped += 1
+        return
 
-            _retry(
-                lambda: notion.pages.update(page_id=page["id"], properties=page_props),
-                what="update page",
-            )
-            log.info("fill  %s (files+%d%s)", label, stats["attached"],
-                     ", metrics" if stats["metrics"] else "")
+    wanted = sorted([*missing, *(["metrics"] if want_metrics else [])])
+    try:
+        if dry_run:
+            log.info("DRY   backfill %s: would fill %s", label, ", ".join(wanted))
             result.created += 1
-            result.attached += stats["attached"]
-            result.metrics += 1 if stats["metrics"] else 0
+            result.attached += len(missing)
+            result.metrics += 1 if want_metrics else 0
             result.created_labels.append(label)
-            if pacing:
-                time.sleep(pacing)
-        except Exception as e:  # noqa: BLE001
-            log.error("FAIL  %s: %s", label, e)
-            result.failed += 1
-            result.failures.append(f"{label}: {e}")
+            return
+
+        activity = {"activityId": activity_id, "activityName": title}
+        page_props, stats = build_media_props(
+            garmin, notion, activity,
+            fit_prop=missing.get("fit"),
+            gpx_prop=missing.get("gpx"),
+            metrics=metrics if want_metrics else None,
+        )
+        if not page_props:
+            log.warning("skip  %s: nothing could be produced from Garmin", label)
+            result.skipped += 1
+            return
+
+        _retry(
+            lambda: notion.pages.update(page_id=page["id"], properties=page_props),
+            what="update page",
+        )
+        log.info("fill  %s (files+%d%s)", label, stats["attached"],
+                 ", metrics" if stats["metrics"] else "")
+        result.created += 1
+        result.attached += stats["attached"]
+        result.metrics += 1 if stats["metrics"] else 0
+        result.created_labels.append(label)
+        if pacing:
+            time.sleep(pacing)
+    except Exception as e:  # noqa: BLE001
+        log.error("FAIL  %s: %s", label, e)
+        result.failed += 1
+        result.failures.append(f"{label}: {e}")
 
 
 def backfill_once(force: bool = False, dry_run: bool = False) -> SyncResult:

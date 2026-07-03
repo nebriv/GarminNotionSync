@@ -8,6 +8,7 @@ exercised is ``garmin-fit-sdk`` (for the FIT→JSON decode), guarded with
 from __future__ import annotations
 
 import datetime
+import gzip
 import io
 import json
 import zipfile
@@ -304,10 +305,14 @@ def test_build_media_props_uploads_both(monkeypatch):
 
     assert stats == {"attached": 2, "metrics": False}
     assert set(props) == {"FIT File", "GPX File"}
-    assert props["FIT File"]["files"][0]["name"] == "Morning_Run-777.json"
-    assert props["GPX File"]["files"][0]["name"] == "Morning_Run-777.xml"
-    assert notion.file_uploads.created[0]["content_type"] == "application/json"
-    assert notion.file_uploads.created[1]["content_type"] == "application/xml"
+    # All attachments are stored gzipped (.gz, application/gzip) for consistency.
+    assert props["FIT File"]["files"][0]["name"] == "Morning_Run-777.json.gz"
+    assert props["GPX File"]["files"][0]["name"] == "Morning_Run-777.xml.gz"
+    assert notion.file_uploads.created[0]["content_type"] == "application/gzip"
+    assert notion.file_uploads.created[1]["content_type"] == "application/gzip"
+    # The GPX upload is a valid gzip of the original bytes.
+    gpx_sent = notion.file_uploads.sent[1]["file"]
+    assert gzip.decompress(gpx_sent[1]) == b"<gpx>track</gpx>"
 
 
 def test_build_media_props_isolates_failures(monkeypatch):
@@ -338,6 +343,29 @@ def test_build_media_props_size_guard(monkeypatch):
     )
     assert stats["attached"] == 0
     assert props == {}
+
+
+# --------------------------------------------------------------------------- #
+# _upload_files_prop — gzip
+# --------------------------------------------------------------------------- #
+
+
+def test_upload_files_prop_gzips_and_shrinks():
+    notion = FakeNotion()
+    payload = b'{"x":1}' * 20_000              # highly compressible JSON-ish
+    fp = sync._upload_files_prop(notion, payload, "big.json", max_bytes=10_000_000, what="t")
+    assert fp["files"][0]["name"] == "big.json.gz"
+    name, data, ctype = notion.file_uploads.sent[0]["file"]
+    assert name == "big.json.gz" and ctype == "application/gzip"
+    assert gzip.decompress(data) == payload   # lossless
+    assert len(data) < len(payload)           # actually smaller
+
+
+def test_upload_files_prop_skips_when_still_too_big():
+    notion = FakeNotion()
+    fp = sync._upload_files_prop(notion, b"anything", "x.json", max_bytes=0, what="t")
+    assert fp is None
+    assert notion.file_uploads.sent == []
 
 
 # --------------------------------------------------------------------------- #
@@ -387,7 +415,7 @@ def test_build_media_props_computes_metrics(monkeypatch):
 
     assert stats["metrics"] is True
     assert stats["attached"] == 1                       # the metrics JSON file
-    assert props["Metrics JSON"]["files"][0]["name"].endswith(".metrics.json")
+    assert props["Metrics JSON"]["files"][0]["name"].endswith(".metrics.json.gz")
     assert "Aerobic Decoupling (%)" in props            # headline scalar promoted
     assert "Ascent Source" in props
 
