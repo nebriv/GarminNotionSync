@@ -1,3 +1,5 @@
+![Created with Generative AI](https://img.shields.io/badge/⚠️_Created_with_Generative_AI-orange?style=flat)
+
 # Garmin → Notion Exercise Log Sync
 
 Pulls hikes and runs from Garmin Connect into a Notion database. Idempotent — safe to
