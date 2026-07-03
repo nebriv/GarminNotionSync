@@ -1,0 +1,50 @@
+services:
+  garmin-notion-sync:
+    image: ghcr.io/nebriv/garminnotionsync:latest
+    # To build the image locally instead of pulling from GHCR, comment the `image:`
+    # line above and uncomment the next line:
+    # build: .
+    container_name: garmin-notion-sync
+    restart: unless-stopped
+
+    # Secrets + config live in .env (copy .env.example to .env first).
+    env_file: .env
+
+    # Operational knobs (overridable in .env; defaults shown). Interpolated from the
+    # same .env, so setting them there wins.
+    environment:
+      TZ: ${TZ:-UTC}
+      SYNC_INTERVAL_HOURS: ${SYNC_INTERVAL_HOURS:-12}
+      SYNC_DAYS: ${SYNC_DAYS:-2}
+      RUN_ON_START: ${RUN_ON_START:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-text}
+      NOTIFY_ON_SUCCESS: ${NOTIFY_ON_SUCCESS:-new}
+      METRICS_PORT: ${METRICS_PORT:-9100}
+
+    # Named volume persists Garmin tokens + run state across restarts. A named volume
+    # (rather than a host bind-mount) inherits the image's uid-1000 ownership, so the
+    # non-root container can always write to it — no host chown needed.
+    volumes:
+      - garmin-data:/data
+
+    # Exposes /healthz, /status and Prometheus /metrics. Remove if you don't need it.
+    # Host and container ports both track METRICS_PORT so changing it stays consistent.
+    ports:
+      - "${METRICS_PORT:-9100}:${METRICS_PORT:-9100}"
+
+    healthcheck:
+      test: ["CMD", "python", "/app/healthcheck.py"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  garmin-data:

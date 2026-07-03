@@ -1,6 +1,8 @@
 .claude/
-.github/
 .idea/
+
+# Container runtime data (Garmin tokens, run state)
+/data/
 
 .env
 .venv/

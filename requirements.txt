@@ -1,3 +1,9 @@
-garminconnect>=0.2.25
-notion-client>=2.2.1
-python-dotenv>=1.0.1
+# Pinned for reproducible image builds.
+garminconnect==0.3.2
+notion-client==3.0.0
+python-dotenv==1.2.2
+
+# Container runtime: scheduling, notifications, metrics.
+APScheduler==3.11.2
+apprise==1.11.0
+prometheus-client==0.25.0
