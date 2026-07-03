@@ -175,6 +175,7 @@ class FakeDataSources:
     def __init__(self, properties: dict, pages: list[dict] | None = None):
         self._properties = properties
         self._pages = pages or []
+        self.created: dict = {}
 
     def retrieve(self, data_source_id):
         return {"properties": self._properties}
@@ -182,6 +183,11 @@ class FakeDataSources:
     def query(self, **kwargs):
         # Single-page result; pagination is exercised separately.
         return {"results": self._pages, "has_more": False, "next_cursor": None}
+
+    def update(self, data_source_id, properties):
+        self.created = dict(properties)
+        self._properties.update(properties)
+        return {"properties": self._properties}
 
 
 class FakePages:
@@ -267,55 +273,184 @@ def test_attachment_targets_custom_property_names(monkeypatch):
 ACTIVITY = {"activityId": 777, "activityName": "Morning Run"}
 
 
-def test_build_attachment_props_uploads_both(monkeypatch):
+def _synth_gpx(n: int = 60) -> bytes:
+    t0 = datetime.datetime(2026, 6, 20, 6, 0, 0, tzinfo=datetime.timezone.utc)
+    pts = []
+    for i in range(n):
+        lat, lon, ele = 44.1 + i * 1e-4, -73.9 + i * 1e-4, 100 + i * 3
+        t = (t0 + datetime.timedelta(seconds=i * 4)).isoformat().replace("+00:00", "Z")
+        pts.append(
+            f'<trkpt lat="{lat}" lon="{lon}"><ele>{ele}</ele><time>{t}</time>'
+            f"<extensions><ns3:TrackPointExtension>"
+            f"<ns3:hr>{120 + i}</ns3:hr><ns3:atemp>15</ns3:atemp><ns3:cad>70</ns3:cad>"
+            f"</ns3:TrackPointExtension></extensions></trkpt>"
+        )
+    return (
+        '<?xml version="1.0"?>\n<gpx xmlns="http://www.topografix.com/GPX/1/1" '
+        'xmlns:ns3="http://www.garmin.com/xmlschemas/TrackPointExtension/v1">'
+        "<trk><trkseg>" + "".join(pts) + "</trkseg></trk></gpx>"
+    ).encode()
+
+
+def test_build_media_props_uploads_both(monkeypatch):
     monkeypatch.delenv("NOTION_UPLOAD_MAX_MB", raising=False)
-    fit = _tiny_fit_bytes()
-    fit_zip = _zip_with({"777.fit": fit})
+    fit_zip = _zip_with({"777.fit": _tiny_fit_bytes()})
     garmin = FakeGarmin(fit=fit_zip, gpx=b"<gpx>track</gpx>")
     notion = FakeNotion()
 
-    props, attached = sync.build_attachment_props(
-        garmin, notion, ACTIVITY, {"fit": "FIT File", "gpx": "GPX File"}
+    props, stats = sync.build_media_props(
+        garmin, notion, ACTIVITY, fit_prop="FIT File", gpx_prop="GPX File", metrics=None
     )
 
-    assert attached == 2
+    assert stats == {"attached": 2, "metrics": False}
     assert set(props) == {"FIT File", "GPX File"}
-    # FIT went up as JSON, GPX as XML, both named from the activity slug.
     assert props["FIT File"]["files"][0]["name"] == "Morning_Run-777.json"
     assert props["GPX File"]["files"][0]["name"] == "Morning_Run-777.xml"
     assert notion.file_uploads.created[0]["content_type"] == "application/json"
     assert notion.file_uploads.created[1]["content_type"] == "application/xml"
 
 
-def test_build_attachment_props_isolates_failures(monkeypatch):
+def test_build_media_props_isolates_failures(monkeypatch):
     monkeypatch.delenv("NOTION_UPLOAD_MAX_MB", raising=False)
     garmin = FakeGarmin(fail=True)  # every download raises
-    notion = FakeNotion()
-    props, attached = sync.build_attachment_props(
-        garmin, notion, ACTIVITY, {"fit": "FIT File", "gpx": "GPX File"}
+    props, stats = sync.build_media_props(
+        garmin, FakeNotion(), ACTIVITY, fit_prop="FIT File", gpx_prop="GPX File", metrics=None
     )
-    assert attached == 0
+    assert stats["attached"] == 0
     assert props == {}
 
 
-def test_build_attachment_props_skips_missing_gpx(monkeypatch):
+def test_build_media_props_skips_missing_gpx(monkeypatch):
     monkeypatch.delenv("NOTION_UPLOAD_MAX_MB", raising=False)
     garmin = FakeGarmin(gpx=b"")  # empty GPX → skipped
-    props, attached = sync.build_attachment_props(
-        garmin, FakeNotion(), ACTIVITY, {"gpx": "GPX File"}
+    props, stats = sync.build_media_props(
+        garmin, FakeNotion(), ACTIVITY, fit_prop=None, gpx_prop="GPX File", metrics=None
     )
-    assert attached == 0
+    assert stats["attached"] == 0
     assert props == {}
 
 
-def test_build_attachment_props_size_guard(monkeypatch):
+def test_build_media_props_size_guard(monkeypatch):
     monkeypatch.setenv("NOTION_UPLOAD_MAX_MB", "0")  # nothing fits under 0 MB
     garmin = FakeGarmin(gpx=b"<gpx>too big</gpx>")
-    props, attached = sync.build_attachment_props(
-        garmin, FakeNotion(), ACTIVITY, {"gpx": "GPX File"}
+    props, stats = sync.build_media_props(
+        garmin, FakeNotion(), ACTIVITY, fit_prop=None, gpx_prop="GPX File", metrics=None
     )
-    assert attached == 0
+    assert stats["attached"] == 0
     assert props == {}
+
+
+# --------------------------------------------------------------------------- #
+# GPX / FIT adapters + metrics integration
+# --------------------------------------------------------------------------- #
+
+
+def test_parse_gpx_track():
+    track = sync.parse_gpx_track(_synth_gpx(10))
+    assert len(track) == 10
+    p = track[0]
+    assert p["lat"] == pytest.approx(44.1)
+    assert p["ele"] == pytest.approx(100.0)
+    assert p["hr"] == 120 and p["temp"] == 15.0 and p["cad"] == 70
+    assert p["t"] is not None
+
+
+def test_fit_summary():
+    messages = {"session_mesgs": [{
+        "total_ascent": 100, "total_descent": 90,
+        "total_calories": 500, "total_training_effect": 3.2,
+    }]}
+    s = sync.fit_summary(messages)
+    assert s["ascent_ft"] == 328 and s["descent_ft"] == 295
+    assert s["calories"] == 500.0 and s["aerobic_te"] == pytest.approx(3.2)
+    assert sync.fit_summary(None) == {}
+    assert sync.fit_summary({"session_mesgs": []}) == {}
+
+
+def _metrics_target(headline=None):
+    import activity_metrics as am
+    return sync.MetricsTarget(
+        json_prop="Metrics JSON",
+        headline_cols=set(sync.METRIC_PROPERTY_SPECS) if headline is None else headline,
+        cfg=am.Config(),
+    )
+
+
+def test_build_media_props_computes_metrics(monkeypatch):
+    monkeypatch.delenv("NOTION_UPLOAD_MAX_MB", raising=False)
+    garmin = FakeGarmin(gpx=_synth_gpx(60))
+    notion = FakeNotion()
+
+    props, stats = sync.build_media_props(
+        garmin, notion, ACTIVITY, fit_prop=None, gpx_prop=None, metrics=_metrics_target()
+    )
+
+    assert stats["metrics"] is True
+    assert stats["attached"] == 1                       # the metrics JSON file
+    assert props["Metrics JSON"]["files"][0]["name"].endswith(".metrics.json")
+    assert "Aerobic Decoupling (%)" in props            # headline scalar promoted
+    assert "Ascent Source" in props
+
+
+def test_metrics_headline_filtered_to_existing_columns(monkeypatch):
+    monkeypatch.delenv("NOTION_UPLOAD_MAX_MB", raising=False)
+    garmin = FakeGarmin(gpx=_synth_gpx(60))
+    # Only one headline column exists → only it is written.
+    target = _metrics_target(headline={"HR Response Lag (s)"})
+    props, stats = sync.build_media_props(
+        garmin, FakeNotion(), ACTIVITY, fit_prop=None, gpx_prop=None, metrics=target
+    )
+    assert stats["metrics"] is True
+    headline = set(props) - {"Metrics JSON"}
+    assert headline == {"HR Response Lag (s)"}
+
+
+def test_build_media_props_skips_metrics_short_track(monkeypatch):
+    monkeypatch.delenv("NOTION_UPLOAD_MAX_MB", raising=False)
+    garmin = FakeGarmin(gpx=_synth_gpx(5))              # below METRICS_MIN_TRACKPOINTS
+    props, stats = sync.build_media_props(
+        garmin, FakeNotion(), ACTIVITY, fit_prop=None, gpx_prop=None, metrics=_metrics_target()
+    )
+    assert stats["metrics"] is False
+    assert props == {}
+
+
+# --------------------------------------------------------------------------- #
+# metrics_target (column detection / auto-create)
+# --------------------------------------------------------------------------- #
+
+
+def test_metrics_target_autocreates_missing_columns(monkeypatch):
+    for var in ("SYNC_METRICS", "NOTION_CREATE_COLUMNS", "NOTION_METRICS_PROPERTY"):
+        monkeypatch.delenv(var, raising=False)
+    notion = FakeNotion({"Name": {"type": "title"}})   # no metric columns yet
+    mt = sync.metrics_target(notion, "ds")
+    assert mt is not None
+    assert mt.json_prop == "Metrics JSON"
+    assert "Aerobic Decoupling (%)" in mt.headline_cols
+    assert "Metrics JSON" in notion.data_sources.created   # created via update()
+
+
+def test_metrics_target_disabled(monkeypatch):
+    monkeypatch.setenv("SYNC_METRICS", "false")
+    assert sync.metrics_target(FakeNotion({}), "ds") is None
+
+
+def test_metrics_target_no_create_disables_when_json_missing(monkeypatch):
+    monkeypatch.delenv("SYNC_METRICS", raising=False)
+    monkeypatch.setenv("NOTION_CREATE_COLUMNS", "false")
+    notion = FakeNotion({"Aerobic Decoupling (%)": {"type": "number"}})  # no Metrics JSON
+    assert sync.metrics_target(notion, "ds") is None
+    assert notion.data_sources.created == {}            # nothing auto-created
+
+
+def test_metrics_target_no_create_filters_headline(monkeypatch):
+    monkeypatch.delenv("SYNC_METRICS", raising=False)
+    monkeypatch.setenv("NOTION_CREATE_COLUMNS", "false")
+    notion = FakeNotion({"Metrics JSON": {"type": "files"}})  # json present, no headline cols
+    mt = sync.metrics_target(notion, "ds")
+    assert mt is not None
+    assert mt.headline_cols == set()
 
 
 # --------------------------------------------------------------------------- #
@@ -413,7 +548,7 @@ def test_backfill_fills_missing_and_skips_complete(monkeypatch):
     result = _backfill_result()
 
     sync._backfill_pages(
-        garmin, notion, "ds", {"fit": "FIT File", "gpx": "GPX File"}, result,
+        garmin, notion, "ds", {"fit": "FIT File", "gpx": "GPX File"}, None, result,
         force=False, dry_run=False, pacing=0.0,
     )
 
@@ -436,7 +571,7 @@ def test_backfill_dry_run_uploads_nothing(monkeypatch):
     result = _backfill_result()
 
     sync._backfill_pages(
-        garmin, notion, "ds", {"fit": "FIT File", "gpx": "GPX File"}, result,
+        garmin, notion, "ds", {"fit": "FIT File", "gpx": "GPX File"}, None, result,
         force=False, dry_run=True, pacing=0.0,
     )
 
@@ -456,7 +591,7 @@ def test_backfill_no_files_available_is_skipped(monkeypatch):
     result = _backfill_result()
 
     sync._backfill_pages(
-        garmin, notion, "ds", {"gpx": "GPX File"}, result,
+        garmin, notion, "ds", {"gpx": "GPX File"}, None, result,
         force=False, dry_run=False, pacing=0.0,
     )
 
@@ -464,3 +599,28 @@ def test_backfill_no_files_available_is_skipped(monkeypatch):
     assert result.skipped == 1
     assert result.failed == 0
     assert notion.pages.updated == []
+
+
+def test_backfill_computes_metrics_for_existing_page(monkeypatch):
+    monkeypatch.delenv("NOTION_UPLOAD_MAX_MB", raising=False)
+    garmin = FakeGarmin(gpx=_synth_gpx(60))
+    # Page has GPX already but no metrics → metrics backfilled, files skipped.
+    pages = [{"id": "pg1", "properties": {
+        "Name": _title("Run A"), "Garmin Activity ID": _rich_text("111"),
+        "GPX File": _files("a.xml"), "Metrics JSON": _files()}}]
+    notion = FakeNotion(
+        {"GPX File": {"type": "files"}, "Metrics JSON": {"type": "files"}}, pages
+    )
+    result = _backfill_result()
+
+    sync._backfill_pages(
+        garmin, notion, "ds", {"gpx": "GPX File"}, _metrics_target(), result,
+        force=False, dry_run=False, pacing=0.0,
+    )
+
+    assert result.metrics == 1
+    assert result.created == 1
+    assert [pid for pid, _ in notion.pages.updated] == ["pg1"]
+    written = notion.pages.updated[0][1]
+    assert "Metrics JSON" in written
+    assert "GPX File" not in written                    # already present, not re-fetched

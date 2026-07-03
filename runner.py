@@ -80,12 +80,14 @@ try:
     M_SKIPPED = Gauge("gns_last_run_skipped", "Activities skipped in the last run")
     M_FAILED = Gauge("gns_last_run_failed", "Activities failed in the last run")
     M_ATTACHED = Gauge("gns_last_run_attached", "Activity files (FIT/GPX) attached in the last run")
+    M_METRICS = Gauge("gns_last_run_metrics", "Activities with physiology metrics computed in the last run")
     M_DURATION = Gauge("gns_last_run_duration_seconds", "Duration of the last run")
     M_TOKEN_DAYS = Gauge("gns_garmin_token_days_remaining", "Estimated days until the Garmin refresh token expires")
     M_RUNS = Counter("gns_runs_total", "Total sync runs attempted")
     M_RUN_FAILURES = Counter("gns_run_failures_total", "Total sync runs that ended in failure/auth error")
     M_CREATED_TOTAL = Counter("gns_created_total", "Total Notion pages created")
     M_ATTACHED_TOTAL = Counter("gns_attached_total", "Total activity files attached to Notion")
+    M_METRICS_TOTAL = Counter("gns_metrics_total", "Total activities with metrics computed")
 except ImportError:  # pragma: no cover
     _PROM = False
 
@@ -99,9 +101,11 @@ def _update_metrics(result) -> None:
     M_SKIPPED.set(result.skipped)
     M_FAILED.set(result.failed)
     M_ATTACHED.set(result.attached)
+    M_METRICS.set(result.metrics)
     M_DURATION.set(result.duration_s)
     M_CREATED_TOTAL.inc(result.created)
     M_ATTACHED_TOTAL.inc(result.attached)
+    M_METRICS_TOTAL.inc(result.metrics)
     if result.token_days_remaining is not None:
         M_TOKEN_DAYS.set(result.token_days_remaining)
     if result.ok:

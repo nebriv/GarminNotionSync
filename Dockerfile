@@ -17,7 +17,7 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY sync.py notify.py runner.py healthcheck.py ./
+COPY sync.py activity_metrics.py notify.py runner.py healthcheck.py ./
 
 # Run as a non-root user; /data is the mounted volume for tokens + state.
 RUN useradd --uid 1000 --create-home appuser \

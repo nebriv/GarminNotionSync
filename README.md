@@ -202,6 +202,40 @@ logged and skipped without failing the rest of the activity. Configure via:
 | `NOTION_GPX_PROPERTY` | `GPX File` | Files column for the GPX track |
 | `NOTION_UPLOAD_MAX_MB` | `20` | Skip files larger than this (Notion single-part limit) |
 
+### Physiology metrics
+
+Each activity's GPX track (and FIT summary) are run through
+[`activity_metrics.py`](activity_metrics.py) to compute a structured physiology record:
+summary, HR zones, an **ascent/descent phase split**, **aerobic decoupling**, **HR
+response lag**, **HR recovery** during stops, **cadence-vs-grade** bands, and the
+**scatter + correlation** payloads needed to redraw the response plots (HR-vs-grade,
+speed-vs-grade with Tobler's hiking function, cadence-vs-grade) without re-parsing the
+track.
+
+- The **full JSON record** (~5–25 KB, incl. the scatter point clouds) is attached to a
+  **`Metrics JSON`** file column — the source of truth for redrawing plots.
+- A handful of **headline scalars** are promoted to their own number columns so they
+  filter and roll up across activities: `Aerobic Decoupling (%)`, `HR Response Lag (s)`,
+  `HRR @60s (bpm)`, `HRR Full (bpm)`, `Moving Time (hrs)`, `Stopped Time (min)`,
+  `Ascent VAM (m/h)`, `Descent Speed (kmh)`, `Cadence Flat`, `Cadence Steep`,
+  `Cadence Coverage (%)`, and `Ascent Source`.
+
+By default any of these columns that don't exist are **created automatically** on the
+first run (set `NOTION_CREATE_COLUMNS=false` to opt out and only write to columns you've
+added yourself). Every parameter that moves a number (smoothing window, moving gate, max
+HR, …) is written into the record under `config`, so activities stay comparable even if
+the parameters are retuned later. Metrics run for new activities during a sync and can be
+**back-filled** onto existing rows with `python sync.py --backfill` (same command as the
+file back-fill — it fills whichever of files/metrics a row is missing).
+
+| Var | Default | Purpose |
+|---|---|---|
+| `SYNC_METRICS` | `true` | Master toggle for physiology metrics |
+| `NOTION_METRICS_PROPERTY` | `Metrics JSON` | Files column for the full JSON record |
+| `NOTION_CREATE_COLUMNS` | `true` | Auto-create missing metric columns via the Notion API |
+| `MAX_HR` | `190` | Max HR for the percent-of-max zone model |
+| `METRICS_MIN_TRACKPOINTS` | `30` | Skip metrics for tracks shorter than this (e.g. no-GPS) |
+
 ## Tests
 
 ```bash
@@ -233,6 +267,7 @@ isn't tracked, add its `typeKey` to `TRACKED_TYPES`.
 ## Files
 
 - `sync.py` — sync engine + CLI
+- `activity_metrics.py` — pure physiology-metrics computation (numpy)
 - `runner.py` — scheduler, notifications, health/metrics server (container entrypoint)
 - `notify.py` — Apprise notification wrapper
 - `healthcheck.py` — Docker healthcheck probe
